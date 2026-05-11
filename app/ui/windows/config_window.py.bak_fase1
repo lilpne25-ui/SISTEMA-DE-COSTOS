@@ -1,0 +1,1415 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+import re
+from typing import Optional
+
+from PySide6.QtCore import QRegularExpression, QSortFilterProxyModel, Qt
+from PySide6.QtGui import QFont, QKeySequence, QShortcut, QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QHeaderView,
+    QSplitter,
+    QStackedWidget,
+    QTableView,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.data.repository import Repository
+from app.models.catalogo_item import CatalogoItem
+from app.models.precio_a36_placa import PrecioA36Placa
+from app.models.regla_costo import ReglaCosto
+from app.services import (
+    ImportPreview,
+    exportar_catalogo_items_csv,
+    exportar_catalogo_items_xlsx,
+    exportar_reglas_costo_csv,
+    exportar_reglas_costo_xlsx,
+    exportar_tarifas_a36_csv,
+    exportar_tarifas_a36_xlsx,
+    importar_catalogo_items_csv,
+    importar_reglas_costo_csv,
+    importar_tarifas_a36_csv,
+    LlmBomResult,
+    convertir_solid_a_global_shop,
+)
+from app.ui.delegates import EspesorDelegate, MoneyDelegate
+from app.ui.formatting import formatear_pulgadas
+from app.ui.icons import icon
+from app.ui.models import CatalogoItemRow, CatalogoItemsModel, ReglasCostoModel, TarifasA36Model
+from app.ui.theme import TYPOGRAPHY
+from app.ui.widgets import DangerButton, FormField, PrimaryButton, SecondaryButton, Toast
+
+
+class SearchProxy(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFilterKeyColumn(-1)
+        self.setFilterCaseSensitivity(Qt.CaseInsensitive)
+
+
+class ImportPreviewDialog(QDialog):
+    def __init__(self, title: str, preview: ImportPreview, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(780, 430)
+
+        root = QVBoxLayout(self)
+        lbl = QLabel(f"Nuevas: {preview.nuevas} · Conflictos: {preview.conflictos} · Inválidas: {preview.invalidas}")
+        root.addWidget(lbl)
+
+        table = QTableView()
+        model = QStandardItemModel(self)
+        model.setHorizontalHeaderLabels(["Fila", "Estado", "Mensaje", "Valores"])
+        for row in preview.rows:
+            model.appendRow(
+                [
+                    QStandardItem(str(row.row_number)),
+                    QStandardItem(row.status),
+                    QStandardItem(row.message),
+                    QStandardItem(", ".join(f"{k}={v}" for k, v in row.values.items())),
+                ]
+            )
+        table.setModel(model)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.horizontalHeader().setStretchLastSection(True)
+        root.addWidget(table, 1)
+
+        buttons = QHBoxLayout()
+        btn_cancel = SecondaryButton("Cancelar")
+        btn_ok = PrimaryButton("Confirmar importación")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok.clicked.connect(self.accept)
+        buttons.addStretch(1)
+        buttons.addWidget(btn_cancel)
+        buttons.addWidget(btn_ok)
+        root.addLayout(buttons)
+
+
+class CatalogoItemForm(QDialog):
+    def __init__(
+        self,
+        title: str,
+        parent=None,
+        item: Optional[CatalogoItem] = None,
+        *,
+        permitir_densidad: bool = False,
+        tipos_disponibles: Optional[list[str]] = None,
+    ):
+        super().__init__(parent)
+        self._original = item
+        self._permitir_densidad = permitir_densidad
+        self.setWindowTitle(title)
+        self.resize(420, 280 if permitir_densidad else 220)
+
+        root = QVBoxLayout(self)
+        self.txt_nombre = QLineEdit(item.nombre if item else "")
+        self.txt_prefijo = QLineEdit(item.prefijo_codigo if item else "")
+
+        self.field_nombre = FormField("Nombre", self.txt_nombre)
+        self.field_prefijo = FormField("Prefijo código", self.txt_prefijo)
+
+        root.addWidget(self.field_nombre)
+        root.addWidget(self.field_prefijo)
+
+        self.cmb_tipo_base = QComboBox()
+        self.cmb_tipo_base.setEditable(True)
+        self.cmb_tipo_base.setInsertPolicy(QComboBox.NoInsert)
+        for tipo in (tipos_disponibles or []):
+            if (tipo or "").strip() and self.cmb_tipo_base.findText(tipo) < 0:
+                self.cmb_tipo_base.addItem(tipo)
+        self.field_tipo_base = FormField("Tipo base", self.cmb_tipo_base)
+        if permitir_densidad:
+            if item is not None and (item.tipo_base or "").strip():
+                tipo_base = (item.tipo_base or "").strip()
+                if self.cmb_tipo_base.findText(tipo_base) < 0:
+                    self.cmb_tipo_base.addItem(tipo_base)
+                self.cmb_tipo_base.setCurrentText(tipo_base)
+            root.addWidget(self.field_tipo_base)
+
+        self.spn_densidad = QDoubleSpinBox()
+        self.spn_densidad.setRange(0, 25000)
+        self.spn_densidad.setDecimals(3)
+        self.spn_densidad.setSingleStep(0.001)
+        self.spn_densidad.setSuffix(" kg/m³")
+        self.spn_densidad.setSpecialValueText("Sin dato")
+        self.field_densidad = FormField("Densidad", self.spn_densidad)
+        if permitir_densidad:
+            if item is not None and item.densidad_kg_m3 is not None:
+                self.spn_densidad.setValue(float(item.densidad_kg_m3))
+            root.addWidget(self.field_densidad)
+
+        hint = QLabel("Formato de código: <prefijo material>-<prefijo forma>-0001")
+        hint.setProperty("muted", True)
+        root.addWidget(hint)
+
+        row = QHBoxLayout()
+        btn_cancel = SecondaryButton("Cancelar")
+        btn_save = PrimaryButton("Guardar")
+        btn_cancel.clicked.connect(self.reject)
+        btn_save.clicked.connect(self._validate)
+        row.addStretch(1)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_save)
+        root.addLayout(row)
+
+    def _validate(self) -> None:
+        self.field_nombre.clear_error()
+        self.field_prefijo.clear_error()
+        invalid = False
+        if not self.txt_nombre.text().strip():
+            self.field_nombre.set_error("El nombre es obligatorio.")
+            invalid = True
+        if not self.txt_prefijo.text().strip():
+            self.field_prefijo.set_error("El prefijo es obligatorio.")
+            invalid = True
+        if invalid:
+            return
+        self.accept()
+
+    def obtener_item(self) -> CatalogoItem:
+        return CatalogoItem(
+            id=self._original.id if self._original else None,
+            nombre=self.txt_nombre.text().strip(),
+            prefijo_codigo=self.txt_prefijo.text().strip(),
+            tipo_base=(self.cmb_tipo_base.currentText().strip() if self._permitir_densidad else ""),
+            densidad_kg_m3=(float(self.spn_densidad.value()) if self._permitir_densidad and self.spn_densidad.value() > 0 else None),
+        )
+
+
+class ReglaCostoForm(QDialog):
+    FORMAS_BASE = ["PLACA", "REDONDO", "TUBO", "CUADRADO", "RECTANGULAR"]
+
+    def __init__(self, repo: Repository, parent=None, regla: Optional[ReglaCosto] = None):
+        super().__init__(parent)
+        self._repo = repo
+        self._original = regla
+        self.setWindowTitle("Nueva regla de costo" if regla is None else "Editar regla de costo")
+        self.resize(460, 260)
+
+        root = QVBoxLayout(self)
+
+        self.cmb_material = QComboBox()
+        self.cmb_material.setEditable(True)
+        self.cmb_material.setInsertPolicy(QComboBox.NoInsert)
+        self.cmb_forma = QComboBox()
+        self.cmb_forma.setEditable(True)
+        self.cmb_forma.setInsertPolicy(QComboBox.NoInsert)
+        self.cmb_forma.addItem("Todas las formas")
+
+        self.spn_precio = QDoubleSpinBox()
+        self.spn_precio.setRange(0, 1_000_000)
+        self.spn_precio.setDecimals(4)
+        self.spn_precio.setSuffix(" MXN/kg")
+
+        self.field_material = FormField("Material", self.cmb_material)
+        self.field_forma = FormField("Forma", self.cmb_forma)
+        self.field_precio = FormField("Precio por kg", self.spn_precio)
+
+        root.addWidget(self.field_material)
+        root.addWidget(self.field_forma)
+        root.addWidget(self.field_precio)
+
+        row = QHBoxLayout()
+        btn_cancel = SecondaryButton("Cancelar")
+        btn_save = PrimaryButton("Guardar")
+        btn_cancel.clicked.connect(self.reject)
+        btn_save.clicked.connect(self._validate)
+        row.addStretch(1)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_save)
+        root.addLayout(row)
+
+        self._load_catalogs()
+        if regla is not None:
+            self.cmb_material.setCurrentText(regla.material_nombre)
+            self.cmb_forma.setCurrentText(regla.forma_nombre or "Todas las formas")
+            self.spn_precio.setValue(regla.precio_kg)
+
+    def _load_catalogs(self) -> None:
+        self.cmb_material.clear()
+        self.cmb_material.addItems([m.nombre for m in self._repo.listar_catalogo_materiales()])
+
+        current = self.cmb_forma.currentText()
+        self.cmb_forma.clear()
+        self.cmb_forma.addItem("Todas las formas")
+        formas: list[str] = []
+        formas.extend([f.nombre for f in self._repo.listar_catalogo_formas()])
+        formas.extend(self.FORMAS_BASE)
+        seen: set[str] = set()
+        for forma in formas:
+            clean = (forma or "").strip()
+            if not clean:
+                continue
+            key = clean.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            self.cmb_forma.addItem(clean)
+        if current:
+            self.cmb_forma.setCurrentText(current)
+
+    def _validate(self) -> None:
+        self.field_material.clear_error()
+        self.field_forma.clear_error()
+        self.field_precio.clear_error()
+        invalid = False
+
+        if not self.cmb_material.currentText().strip():
+            self.field_material.set_error("El material es obligatorio.")
+            invalid = True
+        forma = self.cmb_forma.currentText().strip()
+        if forma == "Todas las formas":
+            forma = ""
+        original_forma = (self._original.forma_nombre or "").strip() if self._original else None
+        if forma == "" and (self._original is None or original_forma != ""):
+            self.field_forma.set_error("Define forma específica (ej. PLACA o REDONDO).")
+            invalid = True
+        if self.spn_precio.value() <= 0:
+            self.field_precio.set_error("El precio debe ser mayor a 0.")
+            invalid = True
+
+        if invalid:
+            return
+        self.accept()
+
+    def obtener_regla(self) -> ReglaCosto:
+        forma = self.cmb_forma.currentText().strip()
+        if forma == "Todas las formas":
+            forma = ""
+        return ReglaCosto(
+            id=self._original.id if self._original else None,
+            material_nombre=self.cmb_material.currentText().strip(),
+            forma_nombre=forma,
+            precio_kg=float(self.spn_precio.value()),
+        )
+
+
+class A36PriceForm(QDialog):
+    def __init__(self, parent=None, precio: Optional[PrecioA36Placa] = None):
+        super().__init__(parent)
+        self._original = precio
+        self.setWindowTitle("Nueva tarifa A36" if precio is None else "Editar tarifa A36")
+        self.resize(460, 280)
+
+        root = QVBoxLayout(self)
+
+        self.lbl_rango = QLabel("Rango: --")
+        font = QFont(TYPOGRAPHY.family_mono)
+        font.setPixelSize(TYPOGRAPHY.xl)
+        font.setWeight(QFont.Weight.DemiBold)
+        self.lbl_rango.setFont(font)
+        root.addWidget(self.lbl_rango)
+
+        self.spn_min = QDoubleSpinBox()
+        self.spn_min.setRange(0, 12)
+        self.spn_min.setDecimals(3)
+        self.spn_min.setSingleStep(0.125)
+        self.spn_min.valueChanged.connect(self._update_preview)
+
+        self.spn_max = QDoubleSpinBox()
+        self.spn_max.setRange(0, 12)
+        self.spn_max.setDecimals(3)
+        self.spn_max.setSingleStep(0.125)
+        self.spn_max.valueChanged.connect(self._update_preview)
+
+        self.spn_precio = QDoubleSpinBox()
+        self.spn_precio.setRange(0, 1_000_000)
+        self.spn_precio.setDecimals(4)
+        self.spn_precio.setSuffix(" MXN/kg")
+
+        self.field_min = FormField("Espesor mínimo", self.spn_min)
+        self.field_max = FormField("Espesor máximo", self.spn_max)
+        self.field_precio = FormField("Precio por kg", self.spn_precio)
+
+        root.addWidget(self.field_min)
+        root.addWidget(self.field_max)
+        root.addWidget(self.field_precio)
+
+        row = QHBoxLayout()
+        btn_cancel = SecondaryButton("Cancelar")
+        btn_save = PrimaryButton("Guardar")
+        btn_cancel.clicked.connect(self.reject)
+        btn_save.clicked.connect(self._validate)
+        row.addStretch(1)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_save)
+        root.addLayout(row)
+
+        if precio is not None:
+            self.spn_min.setValue(precio.espesor_min_pulgadas)
+            self.spn_max.setValue(precio.espesor_max_pulgadas)
+            self.spn_precio.setValue(precio.precio_kg)
+        else:
+            self.spn_min.setValue(0.125)
+            self.spn_max.setValue(0.125)
+
+        self._update_preview()
+
+    def _update_preview(self) -> None:
+        esp_min = float(self.spn_min.value())
+        esp_max = float(self.spn_max.value())
+        if abs(esp_min - esp_max) <= 0.001:
+            self.lbl_rango.setText(f"Rango: {formatear_pulgadas(esp_min)}")
+        else:
+            self.lbl_rango.setText(f"Rango: {formatear_pulgadas(esp_min)} a {formatear_pulgadas(esp_max)}")
+
+    def _validate(self) -> None:
+        self.field_min.clear_error()
+        self.field_max.clear_error()
+        self.field_precio.clear_error()
+        invalid = False
+
+        if self.spn_min.value() <= 0:
+            self.field_min.set_error("El espesor mínimo debe ser mayor a 0.")
+            invalid = True
+        if self.spn_max.value() <= 0:
+            self.field_max.set_error("El espesor máximo debe ser mayor a 0.")
+            invalid = True
+        if self.spn_min.value() > self.spn_max.value():
+            self.field_max.set_error("El espesor máximo debe ser mayor o igual al mínimo.")
+            invalid = True
+        if self.spn_precio.value() <= 0:
+            self.field_precio.set_error("El precio debe ser mayor a 0.")
+            invalid = True
+
+        if invalid:
+            return
+        self.accept()
+
+    def obtener_precio(self) -> PrecioA36Placa:
+        esp_min = float(self.spn_min.value())
+        esp_max = float(self.spn_max.value())
+        if abs(esp_min - esp_max) <= 0.001:
+            rango = formatear_pulgadas(esp_min)
+        else:
+            rango = f"{formatear_pulgadas(esp_min)} a {formatear_pulgadas(esp_max)}"
+        return PrecioA36Placa(
+            id=self._original.id if self._original else None,
+            espesor_min_pulgadas=esp_min,
+            espesor_max_pulgadas=esp_max,
+            precio_kg=float(self.spn_precio.value()),
+            rango_label=rango,
+        )
+
+
+@dataclass
+class SectionWidgets:
+    page: QWidget
+    title: QLabel
+    subtitle: QLabel
+    search: QLineEdit
+    btn_import: SecondaryButton
+    btn_export: SecondaryButton
+    btn_nuevo: PrimaryButton
+    table: QTableView
+    btn_editar: SecondaryButton
+    btn_eliminar: DangerButton
+    footer: QLabel
+
+
+class ConfigWindow(QMainWindow):
+    def __init__(self, repo: Repository, parent=None):
+        super().__init__(parent)
+        self.repo = repo
+        self._llm_source_path = ""
+        self._llm_precio_default_kg = 0.0
+        self._llm_template_path = ""
+        self._llm_material_catalog: list[str] = []
+        self._llm_material_density_map: dict[str, float] = {}
+        self._llm_regla_cache: dict[tuple[str, str, str, float], float | None] = {}
+        self._llm_density_cache: dict[str, float | None] = {}
+        self._llm_result: Optional[LlmBomResult] = None
+        self.setWindowTitle("Configuración")
+        self.resize(1080, 640)
+
+        self._build_ui()
+        self._config_shortcuts()
+        self._load_all()
+
+    def _build_ui(self) -> None:
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(1)
+
+        self.nav = QListWidget()
+        self.nav.setObjectName("configNav")
+        self.nav.setFixedWidth(220)
+        self.nav.addItem(QListWidgetItem(icon("file-text"), "Tarifas A36"))
+        self.nav.addItem(QListWidgetItem(icon("list"), "Reglas de costo"))
+        self.nav.addItem(QListWidgetItem(icon("box"), "Catálogo de materiales"))
+        self.nav.addItem(QListWidgetItem(icon("box"), "Catálogo de formas"))
+        self.nav.addItem(QListWidgetItem(icon("upload"), "LLM SOLID -> GLOBAL SHOP"))
+
+        self.stack = QStackedWidget()
+        self.page_tarifas = self._create_section("Tarifas A36", "Gestiona rangos de espesor y precio por kg.")
+        self.page_reglas = self._create_section("Reglas de costo", "Define precio base por material y forma.")
+        self.page_mat = self._create_section("Catálogo de materiales", "Administra nombres y prefijos de material.")
+        self.page_for = self._create_section("Catálogo de formas", "Administra nombres y prefijos de forma.")
+        self.page_llm = self._create_section(
+            "LLM SOLID -> GLOBAL SHOP",
+            "Carga un Excel de SOLIDWORKS, normaliza formato Global Shop y calcula costos por stock size.",
+        )
+
+        self.stack.addWidget(self.page_tarifas.page)
+        self.stack.addWidget(self.page_reglas.page)
+        self.stack.addWidget(self.page_mat.page)
+        self.stack.addWidget(self.page_for.page)
+        self.stack.addWidget(self.page_llm.page)
+
+        splitter.addWidget(self.nav)
+        splitter.addWidget(self.stack)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        self.setCentralWidget(splitter)
+
+        self.nav.currentRowChanged.connect(lambda i: self.stack.setCurrentIndex(max(0, i)))
+        self.nav.setCurrentRow(0)
+
+        self.page_llm.search.setPlaceholderText("Filtrar preview...")
+        self.page_llm.btn_import.setText("Cargar SOLID")
+        self.page_llm.btn_import.setIcon(icon("upload"))
+        self.page_llm.btn_export.setText("Guardar GLOBAL SHOP")
+        self.page_llm.btn_export.setIcon(icon("download"))
+        self.page_llm.btn_nuevo.setText("Recalcular")
+        self.page_llm.btn_nuevo.setIcon(icon("plus"))
+        self.page_llm.btn_editar.setText("Plantilla ERP")
+        self.page_llm.btn_editar.setIcon(icon("edit-2"))
+        self.page_llm.btn_eliminar.hide()
+
+        self._build_models()
+        self._connect_actions()
+
+    def _create_section(self, title: str, subtitle: str) -> SectionWidgets:
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        lbl_title = QLabel(title)
+        lbl_title.setProperty("role", "page-title")
+        lbl_subtitle = QLabel(subtitle)
+        lbl_subtitle.setProperty("role", "page-subtitle")
+        lbl_subtitle.setProperty("muted", True)
+
+        search = QLineEdit()
+        search.setPlaceholderText("Buscar…")
+        search.setClearButtonEnabled(True)
+
+        btn_import = SecondaryButton("Importar")
+        btn_import.setIcon(icon("upload"))
+        btn_export = SecondaryButton("Exportar")
+        btn_export.setIcon(icon("download"))
+        btn_nuevo = PrimaryButton("Nuevo")
+        btn_nuevo.setIcon(icon("plus"))
+
+        action = QHBoxLayout()
+        action.addWidget(search)
+        action.addStretch(1)
+        action.addWidget(btn_import)
+        action.addWidget(btn_export)
+        action.addWidget(btn_nuevo)
+
+        table = QTableView()
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(28)
+        table.horizontalHeader().setStretchLastSection(True)
+
+        btn_edit = SecondaryButton("Editar")
+        btn_edit.setIcon(icon("edit-2"))
+        btn_del = DangerButton("Eliminar")
+        btn_del.setIcon(icon("trash-2"))
+        row_ops = QHBoxLayout()
+        row_ops.addStretch(1)
+        row_ops.addWidget(btn_edit)
+        row_ops.addWidget(btn_del)
+
+        footer = QLabel("Última modificación: -- por Operador")
+        footer.setProperty("muted", True)
+
+        root.addWidget(lbl_title)
+        root.addWidget(lbl_subtitle)
+        root.addLayout(action)
+        root.addWidget(table, 1)
+        root.addLayout(row_ops)
+        root.addWidget(footer)
+
+        return SectionWidgets(page, lbl_title, lbl_subtitle, search, btn_import, btn_export, btn_nuevo, table, btn_edit, btn_del, footer)
+
+    def _build_models(self) -> None:
+        self.model_tar = TarifasA36Model(self)
+        self.proxy_tar = SearchProxy(self)
+        self.proxy_tar.setSourceModel(self.model_tar)
+        self.page_tarifas.table.setModel(self.proxy_tar)
+        self.page_tarifas.table.setItemDelegateForColumn(1, EspesorDelegate(self.page_tarifas.table))
+        self.page_tarifas.table.setItemDelegateForColumn(2, EspesorDelegate(self.page_tarifas.table))
+        self.page_tarifas.table.setItemDelegateForColumn(3, MoneyDelegate(self.page_tarifas.table))
+        header_tar = self.page_tarifas.table.horizontalHeader()
+        header_tar.setMinimumSectionSize(110)
+        header_tar.setSectionResizeMode(0, QHeaderView.Stretch)
+        header_tar.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header_tar.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header_tar.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+
+        self.model_reg = ReglasCostoModel(self)
+        self.proxy_reg = SearchProxy(self)
+        self.proxy_reg.setSourceModel(self.model_reg)
+        self.page_reglas.table.setModel(self.proxy_reg)
+        self.page_reglas.table.setItemDelegateForColumn(2, MoneyDelegate(self.page_reglas.table))
+
+        self.model_mat = CatalogoItemsModel(self)
+        self.proxy_mat = SearchProxy(self)
+        self.proxy_mat.setSourceModel(self.model_mat)
+        self.page_mat.table.setModel(self.proxy_mat)
+
+        self.model_for = CatalogoItemsModel(self)
+        self.proxy_for = SearchProxy(self)
+        self.proxy_for.setSourceModel(self.model_for)
+        self.page_for.table.setModel(self.proxy_for)
+
+        self.model_llm = QStandardItemModel(self)
+        self.model_llm.setHorizontalHeaderLabels(
+            [
+                "ITEM",
+                "PART_NO",
+                "DESCRIPTION",
+                "MATERIAL",
+                "SHAPE",
+                "QTY",
+                "STOCK_SIZE_RAW",
+                "LENGTH_MM",
+                "UNIT_WEIGHT_KG",
+                "TOTAL_WEIGHT_KG",
+                "PRICE_KG_MXN",
+                "UNIT_COST_MXN",
+                "TOTAL_COST_MXN",
+                "SOURCE_ROW",
+                "STATUS",
+            ]
+        )
+        self.proxy_llm = SearchProxy(self)
+        self.proxy_llm.setSourceModel(self.model_llm)
+        self.page_llm.table.setModel(self.proxy_llm)
+        header_llm = self.page_llm.table.horizontalHeader()
+        header_llm.setMinimumSectionSize(95)
+        header_llm.setSectionResizeMode(2, QHeaderView.Stretch)
+
+    def _connect_actions(self) -> None:
+        self.page_tarifas.search.textChanged.connect(lambda t: self._set_filter(self.proxy_tar, t))
+        self.page_reglas.search.textChanged.connect(lambda t: self._set_filter(self.proxy_reg, t))
+        self.page_mat.search.textChanged.connect(lambda t: self._set_filter(self.proxy_mat, t))
+        self.page_for.search.textChanged.connect(lambda t: self._set_filter(self.proxy_for, t))
+        self.page_llm.search.textChanged.connect(lambda t: self._set_filter(self.proxy_llm, t))
+
+        self.page_tarifas.btn_nuevo.clicked.connect(self._new_tarifa)
+        self.page_tarifas.btn_editar.clicked.connect(self._edit_tarifa)
+        self.page_tarifas.btn_eliminar.clicked.connect(self._delete_tarifa)
+        self.page_tarifas.btn_export.clicked.connect(self._export_tarifas)
+        self.page_tarifas.btn_import.clicked.connect(self._import_tarifas)
+
+        self.page_reglas.btn_nuevo.clicked.connect(self._new_regla)
+        self.page_reglas.btn_editar.clicked.connect(self._edit_regla)
+        self.page_reglas.btn_eliminar.clicked.connect(self._delete_regla)
+        self.page_reglas.btn_export.clicked.connect(self._export_reglas)
+        self.page_reglas.btn_import.clicked.connect(self._import_reglas)
+
+        self.page_mat.btn_nuevo.clicked.connect(self._new_material_catalog)
+        self.page_mat.btn_editar.clicked.connect(self._edit_material_catalog)
+        self.page_mat.btn_eliminar.clicked.connect(self._delete_material_catalog)
+        self.page_mat.btn_export.clicked.connect(lambda: self._export_catalog("materiales"))
+        self.page_mat.btn_import.clicked.connect(lambda: self._import_catalog("materiales"))
+
+        self.page_for.btn_nuevo.clicked.connect(self._new_forma_catalog)
+        self.page_for.btn_editar.clicked.connect(self._edit_forma_catalog)
+        self.page_for.btn_eliminar.clicked.connect(self._delete_forma_catalog)
+        self.page_for.btn_export.clicked.connect(lambda: self._export_catalog("formas"))
+        self.page_for.btn_import.clicked.connect(lambda: self._import_catalog("formas"))
+
+        self.page_llm.btn_import.clicked.connect(self._llm_cargar_solid)
+        self.page_llm.btn_export.clicked.connect(self._llm_guardar_global_shop)
+        self.page_llm.btn_nuevo.clicked.connect(self._llm_recalcular_preview)
+        self.page_llm.btn_editar.clicked.connect(self._llm_set_template_erp)
+
+    def _config_shortcuts(self) -> None:
+        QShortcut(QKeySequence("Ctrl+1"), self, activated=lambda: self.nav.setCurrentRow(0))
+        QShortcut(QKeySequence("Ctrl+2"), self, activated=lambda: self.nav.setCurrentRow(1))
+        QShortcut(QKeySequence("Ctrl+3"), self, activated=lambda: self.nav.setCurrentRow(2))
+        QShortcut(QKeySequence("Ctrl+4"), self, activated=lambda: self.nav.setCurrentRow(3))
+        QShortcut(QKeySequence("Ctrl+5"), self, activated=lambda: self.nav.setCurrentRow(4))
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=self._focus_search)
+        QShortcut(QKeySequence("Ctrl+N"), self, activated=self._shortcut_new)
+        QShortcut(QKeySequence("Ctrl+E"), self, activated=self._shortcut_export)
+        QShortcut(QKeySequence("Ctrl+I"), self, activated=self._shortcut_import)
+
+    def _toast(self, text: str, variant: str = "info") -> None:
+        Toast.show_toast(self, text, variant)
+
+    @staticmethod
+    def _set_filter(proxy: QSortFilterProxyModel, text: str) -> None:
+        if text.strip():
+            proxy.setFilterRegularExpression(QRegularExpression(QRegularExpression.escape(text.strip()), QRegularExpression.CaseInsensitiveOption))
+        else:
+            proxy.setFilterRegularExpression(QRegularExpression())
+
+    def _current_section(self) -> int:
+        return self.nav.currentRow()
+
+    def _focus_search(self) -> None:
+        pages = [self.page_tarifas, self.page_reglas, self.page_mat, self.page_for, self.page_llm]
+        pages[max(0, self._current_section())].search.setFocus()
+
+    def _shortcut_new(self) -> None:
+        [
+            self._new_tarifa,
+            self._new_regla,
+            self._new_material_catalog,
+            self._new_forma_catalog,
+            self._llm_recalcular_preview,
+        ][max(0, self._current_section())]()
+
+    def _shortcut_export(self) -> None:
+        [
+            self._export_tarifas,
+            self._export_reglas,
+            lambda: self._export_catalog("materiales"),
+            lambda: self._export_catalog("formas"),
+            self._llm_guardar_global_shop,
+        ][max(0, self._current_section())]()
+
+    def _shortcut_import(self) -> None:
+        [
+            self._import_tarifas,
+            self._import_reglas,
+            lambda: self._import_catalog("materiales"),
+            lambda: self._import_catalog("formas"),
+            self._llm_cargar_solid,
+        ][max(0, self._current_section())]()
+
+    def _touch_footer(self, section: SectionWidgets) -> None:
+        section.footer.setText(f"Última modificación: {datetime.now():%Y-%m-%d %H:%M} por Operador")
+
+    def _notificar_materiales_actualizados(self) -> None:
+        parent = self.parent()
+        if parent is None:
+            return
+        refrescar = getattr(parent, "_recargar_materiales", None)
+        if callable(refrescar):
+            refrescar()
+
+    def _load_all(self) -> None:
+        self._load_tarifas()
+        self._load_reglas()
+        self._load_catalog_materiales()
+        self._load_catalog_formas()
+        self._load_llm()
+
+    def refrescar_datos(self) -> None:
+        self._load_all()
+
+    # ---- LLM SOLID -> GLOBAL SHOP ------------------------------------
+    def _load_llm(self) -> None:
+        self._llm_source_path = ""
+        self._llm_result = None
+        self._llm_regla_cache = {}
+        self._llm_density_cache = {}
+        self._llm_material_density_map = {}
+        try:
+            catalog = self.repo.listar_catalogo_materiales()
+            self._llm_material_catalog = [i.nombre for i in catalog]
+            for item in catalog:
+                key = (item.nombre or "").strip().upper()
+                if key and item.densidad_kg_m3 is not None and float(item.densidad_kg_m3) > 0:
+                    self._llm_material_density_map[key] = float(item.densidad_kg_m3)
+        except Exception:
+            self._llm_material_catalog = []
+            self._llm_material_density_map = {}
+        default_template = Path(r"C:\Users\TI\Documents\PRUEBAS LLSMSS\LDM507-473 GLOBAL SHOP.xlsx")
+        if default_template.exists():
+            self._llm_template_path = str(default_template)
+        self.model_llm.removeRows(0, self.model_llm.rowCount())
+        self._llm_refresh_subtitle()
+        self._touch_footer(self.page_llm)
+
+    def _llm_refresh_subtitle(self) -> None:
+        tpl = Path(self._llm_template_path).name if self._llm_template_path else "Sin plantilla definida"
+        base = f"Plantilla ERP: {tpl} | Precio y densidad leídos desde BD (reglas/catálogo/A36)."
+        if self._llm_result is None:
+            self.page_llm.subtitle.setText(base)
+            return
+        self.page_llm.subtitle.setText(
+            f"{base} | Total: {self._llm_result.total_rows} | "
+            f"OK: {self._llm_result.converted_rows} | WARN: {self._llm_result.warning_rows}"
+        )
+
+    def _llm_set_template_erp(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Seleccionar plantilla fija ERP (GLOBAL SHOP)",
+            self._llm_template_path or "",
+            "Excel (*.xlsx *.xlsm *.xltx *.xltm)",
+        )
+        if not path:
+            return
+        self._llm_template_path = path
+        self._llm_refresh_subtitle()
+        self._touch_footer(self.page_llm)
+        self._toast("Plantilla ERP actualizada", "success")
+
+    def _llm_material_candidates(self, material_text: str) -> list[str]:
+        raw = (material_text or "").strip()
+        if not raw:
+            return []
+        candidates: list[str] = [raw]
+        upper = raw.upper()
+        raw_compact = self._llm_compact_material(raw)
+        raw_tokens = self._llm_material_tokens(raw)
+        raw_signature = self._llm_material_signature(raw)
+
+        def add_candidate(value: str) -> None:
+            clean = (value or "").strip()
+            if not clean:
+                return
+            if clean not in candidates:
+                candidates.append(clean)
+
+        for name in self._llm_material_catalog:
+            ref = (name or "").strip()
+            if not ref:
+                continue
+            ref_upper = ref.upper()
+            ref_compact = self._llm_compact_material(ref)
+            ref_tokens = self._llm_material_tokens(ref)
+            ref_signature = self._llm_material_signature(ref)
+            ref_alpha, ref_digits = ref_signature
+            raw_alpha, raw_digits = raw_signature
+
+            # Caso directo: contenido textual.
+            if ref_upper in upper:
+                add_candidate(ref)
+                continue
+
+            # Caso directo normalizado: quita espacios/simbolos, tolera sufijos (ej. 4140T).
+            if ref_compact and (
+                raw_compact == ref_compact
+                or raw_compact.startswith(ref_compact)
+                or ref_compact.startswith(raw_compact)
+                or ref_compact in raw_compact
+            ):
+                add_candidate(ref)
+                continue
+
+            # Coincidencia por "firma" alfa-numérica (ej. AL-6061-T6 vs Aluminio 6061).
+            if raw_signature and ref_signature and raw_signature == ref_signature:
+                add_candidate(ref)
+                continue
+
+            # Variantes con tratamiento/sufijos (ej. AL 6061 T6, 4140T).
+            if ref_digits and raw_digits and ref_digits in raw_digits:
+                if raw_alpha and ref_alpha:
+                    left_raw = raw_alpha[:2]
+                    left_ref = ref_alpha[:2]
+                    if left_raw and left_ref and (left_raw == left_ref or raw_alpha.startswith(ref_alpha) or ref_alpha.startswith(raw_alpha)):
+                        add_candidate(ref)
+                        continue
+
+            # Cobertura por tokens relevantes.
+            if ref_tokens and raw_tokens and all(t in raw_tokens for t in ref_tokens):
+                add_candidate(ref)
+
+        first_token = raw.split(" ")[0].strip()
+        if first_token and first_token not in candidates:
+            candidates.append(first_token)
+        return candidates
+
+    @staticmethod
+    def _llm_compact_material(text: str) -> str:
+        raw = (text or "").upper()
+        return re.sub(r"[^A-Z0-9]+", "", raw)
+
+    @staticmethod
+    def _llm_material_tokens(text: str) -> set[str]:
+        raw = (text or "").upper()
+        tokens = set(re.findall(r"[A-Z]+|\d+", raw))
+        return {t for t in tokens if t and t != "T"}
+
+    @staticmethod
+    def _llm_material_signature(text: str) -> tuple[str, str]:
+        compact = ConfigWindow._llm_compact_material(text)
+        letters = "".join(re.findall(r"[A-Z]+", compact))
+        digits = "".join(re.findall(r"\d+", compact))
+        return letters, digits
+
+    @staticmethod
+    def _llm_forma_candidates(shape: str, shape_hint: str) -> list[str]:
+        hints = []
+        hint = (shape_hint or "").strip()
+        if hint:
+            hints.append(hint)
+        shape_norm = (shape or "").strip().upper()
+        if shape_norm == "REDONDO":
+            hints.extend(["REDONDO", "REDONDA", "BARRA REDONDA", "ROUND"])
+        elif shape_norm == "TUBO":
+            hints.extend(["TUBO", "HUECO", "PIPE", "TUBE"])
+        elif shape_norm == "CUADRADO":
+            hints.extend(["CUADRADO", "CUADRADA", "BARRA CUADRADA", "SQUARE"])
+        else:
+            hints.extend(["RECTANGULAR", "PLACA", "PLATINA", "SOLERA", "FLAT"])
+        hints.append("")
+        dedup: list[str] = []
+        seen = set()
+        for value in hints:
+            k = value.strip().upper()
+            if k in seen:
+                continue
+            seen.add(k)
+            dedup.append(value.strip())
+        return dedup
+
+    @staticmethod
+    def _mm_to_in(mm: float) -> float:
+        return mm / 25.4
+
+    @staticmethod
+    def _llm_is_a36(material_text: str) -> bool:
+        raw = (material_text or "").strip().upper()
+        return "A36" in raw
+
+    def _llm_resolver_densidad(self, material_text: str) -> float | None:
+        key = (material_text or "").strip().upper()
+        if key in self._llm_density_cache:
+            return self._llm_density_cache[key]
+        for candidate in self._llm_material_candidates(material_text):
+            density = self._llm_material_density_map.get(candidate.strip().upper())
+            if density is not None and density > 0:
+                self._llm_density_cache[key] = density
+                return density
+        self._llm_density_cache[key] = None
+        return None
+
+    def _llm_resolver_precio_regla(self, material_text: str, shape: str, shape_hint: str, thickness_mm: float) -> float | None:
+        key = (
+            (material_text or "").strip().upper(),
+            (shape or "").strip().upper(),
+            (shape_hint or "").strip().upper(),
+            round(float(thickness_mm or 0.0), 4),
+        )
+        if key in self._llm_regla_cache:
+            return self._llm_regla_cache[key]
+
+        if self._llm_is_a36(material_text) and (shape or "").strip().upper() in {"RECTANGULAR", "CUADRADO"} and thickness_mm > 0:
+            espesor_pulg = self._mm_to_in(thickness_mm + 10.0)
+            tarifa = self.repo.buscar_precio_a36_placa(espesor_pulg)
+            if tarifa is not None and tarifa.precio_kg > 0:
+                precio = float(tarifa.precio_kg)
+                self._llm_regla_cache[key] = precio
+                return precio
+
+        material_candidates = self._llm_material_candidates(material_text)
+        forma_candidates = self._llm_forma_candidates(shape, shape_hint)
+        for mat in material_candidates:
+            for forma in forma_candidates:
+                regla = self.repo.buscar_regla_costo(mat, forma)
+                if regla is None:
+                    continue
+                precio = float(regla.precio_kg)
+                if precio > 0:
+                    self._llm_regla_cache[key] = precio
+                    return precio
+
+        self._llm_regla_cache[key] = None
+        return None
+
+    def _llm_cargar_solid(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Seleccionar Excel de SOLIDWORKS",
+            "",
+            "Excel (*.xlsx *.xlsm *.xltx *.xltm)",
+        )
+        if not path:
+            return
+        self._llm_source_path = path
+        self._llm_recalcular_preview()
+
+    def _llm_recalcular_preview(self) -> None:
+        if not self._llm_source_path:
+            self._toast("Primero carga un archivo de SOLIDWORKS", "info")
+            return
+        try:
+            self._llm_regla_cache = {}
+            self._llm_result = convertir_solid_a_global_shop(
+                self._llm_source_path,
+                output_path=None,
+                price_resolver=self._llm_resolver_precio_regla,
+                density_resolver=self._llm_resolver_densidad,
+                precio_default_kg=self._llm_precio_default_kg,
+                template_path=self._llm_template_path,
+            )
+            self._llm_actualizar_tabla()
+            self._llm_refresh_subtitle()
+            self._touch_footer(self.page_llm)
+            self._toast("Preview LLM actualizado", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo procesar el Excel: {exc}", "error")
+
+    def _llm_guardar_global_shop(self) -> None:
+        if not self._llm_source_path:
+            self._toast("Primero carga un archivo de SOLIDWORKS", "info")
+            return
+
+        source_name = Path(self._llm_source_path).stem
+        suggested = f"{source_name}_GLOBAL_SHOP.xlsx"
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Guardar Excel Global Shop",
+            suggested,
+            "Excel (*.xlsx)",
+        )
+        if not output_path:
+            return
+        if not output_path.lower().endswith(".xlsx"):
+            output_path += ".xlsx"
+
+        try:
+            self._llm_regla_cache = {}
+            self._llm_result = convertir_solid_a_global_shop(
+                self._llm_source_path,
+                output_path=output_path,
+                price_resolver=self._llm_resolver_precio_regla,
+                density_resolver=self._llm_resolver_densidad,
+                precio_default_kg=self._llm_precio_default_kg,
+                template_path=self._llm_template_path,
+            )
+            self._llm_actualizar_tabla()
+            self._llm_refresh_subtitle()
+            self._touch_footer(self.page_llm)
+            self._toast("Archivo GLOBAL SHOP generado", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo generar el archivo GLOBAL SHOP: {exc}", "error")
+
+    def _llm_actualizar_tabla(self) -> None:
+        self.model_llm.removeRows(0, self.model_llm.rowCount())
+        if self._llm_result is None:
+            return
+        for row in self._llm_result.rows:
+            self.model_llm.appendRow(
+                [
+                    QStandardItem(str(row.item)),
+                    QStandardItem(str(row.part_no)),
+                    QStandardItem(str(row.description)),
+                    QStandardItem(str(row.material)),
+                    QStandardItem(str(row.shape)),
+                    QStandardItem(f"{row.qty:.4f}".rstrip("0").rstrip(".")),
+                    QStandardItem(str(row.stock_size_raw)),
+                    QStandardItem(f"{row.length_mm:.3f}"),
+                    QStandardItem(f"{row.unit_weight_kg:.6f}"),
+                    QStandardItem(f"{row.total_weight_kg:.6f}"),
+                    QStandardItem(f"{row.price_kg_mxn:.4f}"),
+                    QStandardItem(f"{row.unit_cost_mxn:.4f}"),
+                    QStandardItem(f"{row.total_cost_mxn:.4f}"),
+                    QStandardItem(str(row.source_row)),
+                    QStandardItem(str(row.status)),
+                ]
+            )
+
+    # ---- Tarifas -------------------------------------------------------
+    def _load_tarifas(self) -> None:
+        self.model_tar.cargar(self.repo.listar_precios_a36_placa())
+        self._touch_footer(self.page_tarifas)
+
+    def _selected_tarifa(self) -> Optional[PrecioA36Placa]:
+        idx = self.page_tarifas.table.currentIndex()
+        if not idx.isValid():
+            return None
+        return self.model_tar.item_en_fila(self.proxy_tar.mapToSource(idx).row())
+
+    def _count_material_refs_for_tarifa(self, tarifa: PrecioA36Placa) -> int:
+        count = 0
+        for m in self.repo.listar_materiales("Todos", None):
+            if (m.nombre or "").strip().upper() != "A36":
+                continue
+            if (m.forma or "").strip().upper() != "PLACA":
+                continue
+            if m.espesor_pulgadas is None:
+                continue
+            if tarifa.espesor_min_pulgadas <= m.espesor_pulgadas <= tarifa.espesor_max_pulgadas:
+                count += 1
+        return count
+
+    def _new_tarifa(self) -> None:
+        dlg = A36PriceForm(self)
+        if dlg.exec():
+            try:
+                self.repo.crear_precio_a36_placa(dlg.obtener_precio())
+                self._load_tarifas()
+                self._notificar_materiales_actualizados()
+                self._toast("Tarifa A36 creada", "success")
+            except Exception as exc:
+                self._toast(f"No se pudo crear la tarifa: {exc}", "error")
+
+    def _edit_tarifa(self) -> None:
+        item = self._selected_tarifa()
+        if item is None:
+            self._toast("Selecciona una tarifa", "info")
+            return
+        dlg = A36PriceForm(self, item)
+        if dlg.exec():
+            try:
+                self.repo.actualizar_precio_a36_placa(dlg.obtener_precio())
+                self._load_tarifas()
+                self._notificar_materiales_actualizados()
+                self._toast("Tarifa A36 actualizada", "success")
+            except Exception as exc:
+                self._toast(f"No se pudo actualizar la tarifa: {exc}", "error")
+
+    def _delete_tarifa(self) -> None:
+        item = self._selected_tarifa()
+        if item is None:
+            self._toast("Selecciona una tarifa", "info")
+            return
+        refs = self._count_material_refs_for_tarifa(item)
+        extra = (
+            f"\n\nEsta tarifa aplica a {refs} materiales existentes. Al eliminarla, esos materiales perderán su costo sugerido automático."
+            if refs > 0
+            else ""
+        )
+        ans = QMessageBox.question(self, "Eliminar tarifa", f"¿Eliminar la tarifa {item.rango_label}?{extra}")
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            self.repo.eliminar_precio_a36_placa(item.id)
+            self._load_tarifas()
+            self._notificar_materiales_actualizados()
+            self._toast("Tarifa A36 eliminada", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo eliminar la tarifa: {exc}", "error")
+
+    def _export_tarifas(self) -> None:
+        path, selected = QFileDialog.getSaveFileName(self, "Exportar tarifas A36", "tarifas_a36.csv", "CSV (*.csv);;Excel (*.xlsx)")
+        if not path:
+            return
+        rows = self.repo.listar_precios_a36_placa()
+        try:
+            if path.lower().endswith(".xlsx") or "Excel" in selected:
+                if not path.lower().endswith(".xlsx"):
+                    path += ".xlsx"
+                exportar_tarifas_a36_xlsx(path, rows)
+            else:
+                if not path.lower().endswith(".csv"):
+                    path += ".csv"
+                exportar_tarifas_a36_csv(path, rows)
+            self._toast("Tarifas exportadas", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo exportar tarifas: {exc}", "error")
+
+    def _import_tarifas(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Importar tarifas A36", "", "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            preview = importar_tarifas_a36_csv(path, self.repo.listar_precios_a36_placa())
+            dlg = ImportPreviewDialog("Preview importación de tarifas", preview, self)
+            if dlg.exec() and preview.valid_rows:
+                for r in preview.valid_rows:
+                    self.repo.crear_precio_a36_placa(
+                        PrecioA36Placa(
+                            id=None,
+                            espesor_min_pulgadas=float(r["espesor_minimo"]),
+                            espesor_max_pulgadas=float(r["espesor_maximo"]),
+                            precio_kg=float(r["precio_kg"]),
+                            rango_label=r["rango"],
+                        )
+                    )
+                self._load_tarifas()
+                self._notificar_materiales_actualizados()
+                self._toast("Importación de tarifas completada", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo importar tarifas: {exc}", "error")
+
+    # ---- Reglas --------------------------------------------------------
+    def _load_reglas(self) -> None:
+        self.model_reg.cargar(self.repo.listar_reglas_costo())
+        self._touch_footer(self.page_reglas)
+
+    def _selected_regla(self) -> Optional[ReglaCosto]:
+        idx = self.page_reglas.table.currentIndex()
+        if not idx.isValid():
+            return None
+        return self.model_reg.item_en_fila(self.proxy_reg.mapToSource(idx).row())
+
+    def _new_regla(self) -> None:
+        dlg = ReglaCostoForm(self.repo, self)
+        if dlg.exec():
+            try:
+                self.repo.crear_regla_costo(dlg.obtener_regla())
+                self._load_reglas()
+                self._toast("Regla de costo creada", "success")
+            except Exception as exc:
+                self._toast(f"No se pudo crear la regla: {exc}", "error")
+
+    def _edit_regla(self) -> None:
+        item = self._selected_regla()
+        if item is None:
+            self._toast("Selecciona una regla", "info")
+            return
+        dlg = ReglaCostoForm(self.repo, self, item)
+        if dlg.exec():
+            try:
+                self.repo.actualizar_regla_costo(dlg.obtener_regla())
+                self._load_reglas()
+                self._toast("Regla de costo actualizada", "success")
+            except Exception as exc:
+                self._toast(f"No se pudo actualizar la regla: {exc}", "error")
+
+    def _delete_regla(self) -> None:
+        item = self._selected_regla()
+        if item is None:
+            self._toast("Selecciona una regla", "info")
+            return
+        forma = item.forma_nombre or "Todas las formas"
+        ans = QMessageBox.question(self, "Eliminar regla", f"¿Eliminar la regla {item.material_nombre} / {forma}?")
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            if item.id is None:
+                raise ValueError("La regla seleccionada no tiene identificador")
+            self.repo.eliminar_regla_costo(item.id)
+            self._load_reglas()
+            self._toast("Regla de costo eliminada", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo eliminar la regla: {exc}", "error")
+
+    def _export_reglas(self) -> None:
+        path, selected = QFileDialog.getSaveFileName(self, "Exportar reglas", "reglas_costo.csv", "CSV (*.csv);;Excel (*.xlsx)")
+        if not path:
+            return
+        rows = self.repo.listar_reglas_costo()
+        try:
+            if path.lower().endswith(".xlsx") or "Excel" in selected:
+                if not path.lower().endswith(".xlsx"):
+                    path += ".xlsx"
+                exportar_reglas_costo_xlsx(path, rows)
+            else:
+                if not path.lower().endswith(".csv"):
+                    path += ".csv"
+                exportar_reglas_costo_csv(path, rows)
+            self._toast("Reglas exportadas", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo exportar reglas: {exc}", "error")
+
+    def _import_reglas(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Importar reglas", "", "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            preview = importar_reglas_costo_csv(path, self.repo.listar_reglas_costo())
+            dlg = ImportPreviewDialog("Preview importación de reglas", preview, self)
+            if dlg.exec() and preview.valid_rows:
+                for r in preview.valid_rows:
+                    self.repo.crear_regla_costo(ReglaCosto(id=None, material_nombre=r["material"], forma_nombre=r["forma"], precio_kg=float(r["precio_kg"])))
+                self._load_reglas()
+                self._toast("Importación de reglas completada", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo importar reglas: {exc}", "error")
+
+    # ---- Catálogos -----------------------------------------------------
+    def _count_material_ref(self, nombre: str) -> int:
+        target = nombre.strip().upper()
+        return sum(1 for m in self.repo.listar_materiales("Todos", None) if (m.nombre or "").strip().upper() == target)
+
+    def _count_forma_ref(self, nombre: str) -> int:
+        target = nombre.strip().upper()
+        return sum(1 for m in self.repo.listar_materiales("Todos", None) if (m.forma or "").strip().upper() == target)
+
+    def _tipos_base_disponibles(self) -> list[str]:
+        tipos: set[str] = set()
+        for item in self.repo.listar_catalogo_materiales():
+            value = (item.tipo_base or "").strip().upper()
+            if value:
+                tipos.add(value)
+        for material in self.repo.listar_materiales("Todos", None):
+            value = (material.tipo or "").strip().upper()
+            if value:
+                tipos.add(value)
+        return sorted(tipos)
+
+    def _load_catalog_materiales(self) -> None:
+        rows = [CatalogoItemRow(item=i, usado_en=self._count_material_ref(i.nombre)) for i in self.repo.listar_catalogo_materiales()]
+        self.model_mat.cargar(rows)
+        self._touch_footer(self.page_mat)
+
+    def _load_catalog_formas(self) -> None:
+        rows = [CatalogoItemRow(item=i, usado_en=self._count_forma_ref(i.nombre)) for i in self.repo.listar_catalogo_formas()]
+        self.model_for.cargar(rows)
+        self._touch_footer(self.page_for)
+
+    def _selected_catalog_item(self, catalog: str) -> Optional[CatalogoItem]:
+        if catalog == "materiales":
+            idx = self.page_mat.table.currentIndex()
+            if not idx.isValid():
+                return None
+            return self.model_mat.item_en_fila(self.proxy_mat.mapToSource(idx).row())
+        idx = self.page_for.table.currentIndex()
+        if not idx.isValid():
+            return None
+        return self.model_for.item_en_fila(self.proxy_for.mapToSource(idx).row())
+
+    def _new_material_catalog(self) -> None:
+        dlg = CatalogoItemForm(
+            "Nuevo material de catálogo",
+            self,
+            permitir_densidad=True,
+            tipos_disponibles=self._tipos_base_disponibles(),
+        )
+        if dlg.exec():
+            try:
+                self.repo.crear_catalogo_material(dlg.obtener_item())
+                self._load_catalog_materiales()
+                self._toast("Ítem de material creado", "success")
+            except Exception as exc:
+                self._toast(f"No se pudo crear el ítem: {exc}", "error")
+
+    def _edit_material_catalog(self) -> None:
+        item = self._selected_catalog_item("materiales")
+        if item is None:
+            self._toast("Selecciona un ítem", "info")
+            return
+        dlg = CatalogoItemForm(
+            "Editar material de catálogo",
+            self,
+            item,
+            permitir_densidad=True,
+            tipos_disponibles=self._tipos_base_disponibles(),
+        )
+        if dlg.exec():
+            try:
+                self.repo.actualizar_catalogo_material(dlg.obtener_item())
+                self._load_catalog_materiales()
+                self._toast("Ítem de material actualizado", "success")
+            except Exception as exc:
+                self._toast(f"No se pudo actualizar el ítem: {exc}", "error")
+
+    def _delete_material_catalog(self) -> None:
+        item = self._selected_catalog_item("materiales")
+        if item is None:
+            self._toast("Selecciona un ítem", "info")
+            return
+        refs = self._count_material_ref(item.nombre)
+        extra = f"\n\nEste catálogo está referenciado en {refs} materiales existentes." if refs > 0 else ""
+        ans = QMessageBox.question(self, "Eliminar", f"¿Eliminar {item.nombre}?{extra}")
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            self.repo.eliminar_catalogo_material(item.nombre)
+            self._load_catalog_materiales()
+            self._toast("Ítem eliminado", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo eliminar el ítem: {exc}", "error")
+
+    def _new_forma_catalog(self) -> None:
+        dlg = CatalogoItemForm("Nueva forma de catálogo", self)
+        if dlg.exec():
+            try:
+                self.repo.crear_catalogo_forma(dlg.obtener_item())
+                self._load_catalog_formas()
+                self._toast("Ítem de forma creado", "success")
+            except Exception as exc:
+                self._toast(f"No se pudo crear el ítem: {exc}", "error")
+
+    def _edit_forma_catalog(self) -> None:
+        item = self._selected_catalog_item("formas")
+        if item is None:
+            self._toast("Selecciona un ítem", "info")
+            return
+        dlg = CatalogoItemForm("Editar forma de catálogo", self, item)
+        if dlg.exec():
+            try:
+                self.repo.actualizar_catalogo_forma(dlg.obtener_item())
+                self._load_catalog_formas()
+                self._toast("Ítem de forma actualizado", "success")
+            except Exception as exc:
+                self._toast(f"No se pudo actualizar el ítem: {exc}", "error")
+
+    def _delete_forma_catalog(self) -> None:
+        item = self._selected_catalog_item("formas")
+        if item is None:
+            self._toast("Selecciona un ítem", "info")
+            return
+        refs = self._count_forma_ref(item.nombre)
+        extra = f"\n\nEste catálogo está referenciado en {refs} materiales existentes." if refs > 0 else ""
+        ans = QMessageBox.question(self, "Eliminar", f"¿Eliminar {item.nombre}?{extra}")
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            self.repo.eliminar_catalogo_forma(item.nombre)
+            self._load_catalog_formas()
+            self._toast("Ítem eliminado", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo eliminar el ítem: {exc}", "error")
+
+    def _export_catalog(self, catalog: str) -> None:
+        path, selected = QFileDialog.getSaveFileName(self, "Exportar catálogo", f"catalogo_{catalog}.csv", "CSV (*.csv);;Excel (*.xlsx)")
+        if not path:
+            return
+        rows = self.repo.listar_catalogo_materiales() if catalog == "materiales" else self.repo.listar_catalogo_formas()
+        try:
+            if path.lower().endswith(".xlsx") or "Excel" in selected:
+                if not path.lower().endswith(".xlsx"):
+                    path += ".xlsx"
+                exportar_catalogo_items_xlsx(path, rows)
+            else:
+                if not path.lower().endswith(".csv"):
+                    path += ".csv"
+                exportar_catalogo_items_csv(path, rows)
+            self._toast("Catálogo exportado", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo exportar catálogo: {exc}", "error")
+
+    def _import_catalog(self, catalog: str) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Importar catálogo", "", "CSV (*.csv)")
+        if not path:
+            return
+        existing = self.repo.listar_catalogo_materiales() if catalog == "materiales" else self.repo.listar_catalogo_formas()
+        try:
+            preview = importar_catalogo_items_csv(path, existing)
+            dlg = ImportPreviewDialog("Preview importación de catálogo", preview, self)
+            if dlg.exec() and preview.valid_rows:
+                for r in preview.valid_rows:
+                    densidad = r.get("densidad_kg_m3", "").strip()
+                    tipo_base = r.get("tipo_base", "").strip().upper()
+                    item = CatalogoItem(
+                        id=None,
+                        nombre=r["nombre"],
+                        prefijo_codigo=r["prefijo_codigo"],
+                        tipo_base=tipo_base,
+                        densidad_kg_m3=(float(densidad) if densidad else None),
+                    )
+                    if catalog == "materiales":
+                        self.repo.crear_catalogo_material(item)
+                    else:
+                        self.repo.crear_catalogo_forma(item)
+                if catalog == "materiales":
+                    self._load_catalog_materiales()
+                else:
+                    self._load_catalog_formas()
+                self._toast("Importación de catálogo completada", "success")
+        except Exception as exc:
+            self._toast(f"No se pudo importar catálogo: {exc}", "error")

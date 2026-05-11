@@ -1,0 +1,833 @@
+from __future__ import annotations
+
+import math
+import re
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable
+
+from openpyxl import Workbook, load_workbook
+
+_COST_ALLOWED_MANUFACTURERS = {"INNOVAX", "ZP"}
+_COST_ALLOWED_MANUFACTURERS_NORMALIZED = {re.sub(r"[^A-Za-z0-9]+", "", x).upper() for x in _COST_ALLOWED_MANUFACTURERS}
+_HI_MANUFACTURERS = {"VEKTEK", "KOSMEK"}
+_HI_MANUFACTURERS_NORMALIZED = {re.sub(r"[^A-Za-z0-9]+", "", x).upper() for x in _HI_MANUFACTURERS}
+
+_ERP_HEADERS = [
+    "PartNo",
+    "Revision",
+    "Description",
+    "AltDescription1",
+    "AltDescription2",
+    "DescExtra",
+    "Quantity",
+    "IssueUM",
+    "ConsumptionConv",
+    "UM",
+    "Cost",
+    "Source",
+    "Drawing",
+    "Leadtime",
+    "Level",
+    "Location",
+    "Memo1",
+    "Memo2",
+    "Parent",
+    "Productline",
+    "Sequence",
+    "ShotCode",
+    "Tag",
+    "Category",
+    "fabricante",
+    "filepat",
+    "Material",
+    "Peso",
+    "largo",
+    "ancho",
+    "espesor",
+    "tratamiento",
+]
+
+_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
+    "item": ("item", "line", "linea", "pos", "position"),
+    "part_no": ("part no", "part number", "partno", "numero parte", "no parte", "codigo"),
+    "description": ("description", "descripcion", "desc"),
+    "revision": ("revision", "rev"),
+    "alt_description_1": ("altdescription1", "alt description 1", "descripcion 2", "descripcion2"),
+    "alt_description_2": ("altdescription2", "alt description 2", "descripcion 3", "descripcion3"),
+    "desc_extra": ("descextra", "desc extra", "descripcion extra"),
+    "material": ("material", "grade", "alloy", "tipo material"),
+    "shape": ("shape", "forma", "profile", "perfil", "tipo"),
+    "part_type": ("part type", "tipo parte", "tipoparte"),
+    "qty": ("qty", "quantity", "cantidad", "cant"),
+    "stock_size": ("stock size", "stocksize", "raw stock", "size", "medida", "dimension", "dims"),
+    "length": ("length", "largo", "longitud", "len"),
+    "diameter": ("diameter", "diametro", "diam", "ø"),
+    "width": ("width", "ancho"),
+    "thickness": ("thickness", "espesor"),
+    "thickness_or_diameter": ("espesor diametro", "espesor-diametro", "espesor di?metro", "espesor-di?metro"),
+    "weight": ("weight", "peso"),
+    "issue_um": ("issueum", "issue um", "um emision"),
+    "consumption_conv": ("consumptionconv", "consumption conv", "factor consumo", "conv consumo"),
+    "um": ("uom", "unidad", "unidad medida"),
+    "source": ("source", "origen"),
+    "drawing": ("drawing", "dibujo"),
+    "leadtime": ("leadtime", "lead time", "tiempo entrega"),
+    "level": ("level", "nivel"),
+    "location": ("location", "ubicacion"),
+    "memo1": ("memo1", "nota1"),
+    "memo2": ("memo2", "nota2"),
+    "parent": ("parent", "padre", "ensamble", "assembly"),
+    "productline": ("productline", "product line", "linea producto"),
+    "sequence": ("sequence", "secuencia"),
+    "shotcode": ("shotcode", "shot code"),
+    "tag": ("tag", "etiqueta"),
+    "category": ("category", "categoria"),
+    "fabricante": ("fabricante", "manufacturer", "maker"),
+    "fabricado_por": ("fabricadopor", "fabricado por"),
+    "path": ("ruta", "path", "filepath", "file path"),
+    "thermal_treatment": ("tratamiento termico", "tratamiento t?rmico", "tratamiento"),
+}
+
+PriceResolver = Callable[[str, str, str, float], float | None]
+DensityResolver = Callable[[str], float | None]
+
+
+@dataclass(slots=True)
+class LlmBomRow:
+    item: str
+    part_no: str
+    description: str
+    material: str
+    shape: str
+    qty: float
+    stock_size_raw: str
+    length_mm: float
+    unit_weight_kg: float
+    total_weight_kg: float
+    price_kg_mxn: float
+    unit_cost_mxn: float
+    total_cost_mxn: float
+    source_row: int
+    status: str
+    erp_row: list[object]
+    is_stk: bool = False
+
+
+@dataclass(slots=True)
+class LlmBomResult:
+    rows: list[LlmBomRow]
+    source_sheet: str
+    total_rows: int
+    converted_rows: int
+    warning_rows: int
+
+
+def convertir_solid_a_global_shop(
+    source_path: str,
+    output_path: str | None,
+    *,
+    price_resolver: PriceResolver | None = None,
+    density_resolver: DensityResolver | None = None,
+    precio_default_kg: float = 0.0,
+    template_path: str | None = None,
+    fabricante_default: str = "INNOVAX",
+) -> LlmBomResult:
+    rows, sheet_name = _read_source_rows(source_path)
+    parent_fallback = _infer_parent_base(rows, source_path)
+    converted: list[LlmBomRow] = []
+    warnings = 0
+    output_sequence = 1
+
+    for row_data in rows:
+        mapped = row_data["mapped"]
+        source_row = int(row_data["source_row"])
+        row = _convert_row(
+            mapped,
+            source_row,
+            sequence=output_sequence,
+            parent_fallback=parent_fallback,
+            price_resolver=price_resolver,
+            density_resolver=density_resolver,
+            precio_default_kg=precio_default_kg,
+            fabricante_default=fabricante_default,
+        )
+        if row.status != "OK":
+            warnings += 1
+        converted.append(row)
+        output_sequence += 1
+
+        stk_row = _build_stk_row_from_base(
+            base=row,
+            mapped=mapped,
+            source_row=source_row,
+            sequence=output_sequence,
+        )
+        if stk_row is not None:
+            converted.append(stk_row)
+            output_sequence += 1
+
+    result = LlmBomResult(
+        rows=converted,
+        source_sheet=sheet_name,
+        total_rows=len(rows),
+        converted_rows=sum(1 for r in converted if not r.is_stk and r.status == "OK"),
+        warning_rows=warnings,
+    )
+
+    if output_path:
+        _write_output_xlsx(output_path, result.rows, template_path=template_path)
+    return result
+
+
+def _read_source_rows(source_path: str) -> tuple[list[dict[str, object]], str]:
+    wb = load_workbook(filename=source_path, data_only=True)
+    ws = wb.active
+    sheet_name = ws.title
+
+    values = list(ws.iter_rows(values_only=True))
+    if not values:
+        raise ValueError("El archivo no contiene datos.")
+
+    header_row_idx, header_map = _detect_header(values)
+    if header_row_idx < 0 or not header_map:
+        raise ValueError("No se pudieron detectar columnas utiles del Excel de SOLIDWORKS.")
+
+    rows: list[dict[str, object]] = []
+    for row_idx in range(header_row_idx + 1, len(values)):
+        raw_row = values[row_idx]
+        if _row_is_empty(raw_row):
+            continue
+        mapped: dict[str, str] = {}
+        for key, col_idx in header_map.items():
+            mapped[key] = _to_text(raw_row[col_idx] if col_idx < len(raw_row) else None)
+        rows.append({"source_row": row_idx + 1, "mapped": mapped})
+    return rows, sheet_name
+
+
+def _detect_header(rows: list[tuple[object, ...]]) -> tuple[int, dict[str, int]]:
+    best_row = -1
+    best_score = 0
+    best_map: dict[str, int] = {}
+    probe_rows = min(30, len(rows))
+    for idx in range(probe_rows):
+        row = rows[idx]
+        header_map: dict[str, int] = {}
+        for col_idx, value in enumerate(row):
+            cell = _normalize_header(_to_text(value))
+            if not cell:
+                continue
+            for key, aliases in _HEADER_ALIASES.items():
+                for alias in aliases:
+                    if _header_alias_match(cell, alias):
+                        header_map.setdefault(key, col_idx)
+                        break
+        score = len(header_map)
+        if score > best_score:
+            best_score = score
+            best_row = idx
+            best_map = header_map
+    return best_row, best_map
+
+
+def _infer_parent_base(rows: list[dict[str, object]], source_path: str) -> str:
+    for row in rows:
+        mapped = row["mapped"]
+        if isinstance(mapped, dict):
+            part = (mapped.get("part_no") or "").strip()
+            if part:
+                return part
+    return Path(source_path).stem
+
+
+def _convert_row(
+    mapped: dict[str, str],
+    source_row: int,
+    *,
+    sequence: int,
+    parent_fallback: str,
+    price_resolver: PriceResolver | None,
+    density_resolver: DensityResolver | None,
+    precio_default_kg: float,
+    fabricante_default: str,
+) -> LlmBomRow:
+    item = mapped.get("item") or str(source_row)
+    part_no = mapped.get("part_no", "")
+    description = mapped.get("description", "")
+    material = mapped.get("material", "")
+    material_label = mapped.get("material", "") or mapped.get("thickness_or_diameter", "")
+    qty = _to_float(mapped.get("qty")) or 1.0
+    stock_raw = mapped.get("stock_size", "")
+    length_value = _to_float(mapped.get("length"))
+    diameter = _to_float(mapped.get("diameter"))
+    width = _to_float(mapped.get("width"))
+    thickness = _to_float(mapped.get("thickness"))
+    if (thickness is None or thickness <= 0) and _to_float(mapped.get("thickness_or_diameter")):
+        thickness = _to_float(mapped.get("thickness_or_diameter"))
+    shape_hint = mapped.get("shape", "") or mapped.get("part_type", "")
+    weight_input = _to_float(mapped.get("weight"))
+    level_value = int(_to_float(mapped.get("level")) or 0)
+    fabricante = _resolve_fabricante(mapped, fabricante_default)
+    cost_allowed = _is_cost_allowed_manufacturer(fabricante)
+
+    stock_nums = _extract_numbers(stock_raw)
+    shape = _infer_shape(shape_hint, stock_raw, stock_nums, diameter, width, thickness)
+    status_messages: list[str] = []
+    length_mm = 0.0
+    unit_weight = 0.0
+    total_weight = 0.0
+    price_kg = 0.0
+    unit_cost = 0.0
+    total_cost = 0.0
+
+    if cost_allowed and level_value > 0:
+        densidad = density_resolver(material) if density_resolver is not None else None
+        if densidad is None or densidad <= 0:
+            densidad = density_resolver(material_label) if density_resolver is not None else None
+        if densidad is None or densidad <= 0:
+            densidad = 0.0
+            status_messages.append("Sin densidad para material")
+
+        if shape == "REDONDO":
+            d_nom = diameter or (stock_nums[0] if stock_nums else 0.0)
+            l_nom = length_value or (stock_nums[1] if len(stock_nums) >= 2 else 0.0)
+            d_eff = _apply_tolerance(d_nom, 10.0)
+            length_mm = _apply_tolerance(l_nom, 20.0)
+            if d_eff > 0 and length_mm > 0 and densidad > 0:
+                unit_weight = ((math.pi * (d_eff**2) * length_mm * densidad) / 4_000_000_000.0)
+            else:
+                status_messages.append("Falta diametro o largo")
+        elif shape == "CUADRADO":
+            side_nom, l_nom = _infer_square_dims(stock_nums)
+            if width and width > 0:
+                side_nom = width
+            if length_value and length_value > 0:
+                l_nom = length_value
+            side_eff = _apply_tolerance(side_nom, 10.0)
+            length_mm = _apply_tolerance(l_nom, 10.0)
+            if side_eff > 0 and length_mm > 0 and densidad > 0:
+                unit_weight = ((side_eff * side_eff * length_mm * densidad) / 1_000_000_000.0)
+            else:
+                status_messages.append("Falta lado o largo")
+        elif shape == "TUBO":
+            od_nom, id_nom, l_nom = _infer_tube_dims(stock_nums, length_value, diameter, thickness)
+            od_eff = _apply_tolerance(od_nom, 10.0)
+            id_eff = id_nom
+            length_mm = _apply_tolerance(l_nom, 20.0)
+            if od_eff > 0 and id_eff >= 0 and od_eff > id_eff and length_mm > 0 and densidad > 0:
+                unit_weight = ((math.pi * ((od_eff**2) - (id_eff**2)) * length_mm * densidad) / 4_000_000_000.0)
+            else:
+                status_messages.append("Falta OD/ID/largo para tubo")
+        else:
+            ancho_nom, espesor_nom, l_nom = _infer_rect_dims(stock_nums)
+            if width and width > 0:
+                ancho_nom = width
+            if thickness and thickness > 0:
+                espesor_nom = thickness
+            if length_value and length_value > 0:
+                l_nom = length_value
+            ancho_eff = _apply_tolerance(ancho_nom, 10.0)
+            espesor_eff = _apply_tolerance(espesor_nom, 10.0)
+            length_mm = _apply_tolerance(l_nom, 10.0)
+            if ancho_eff > 0 and espesor_eff > 0 and length_mm > 0 and densidad > 0:
+                unit_weight = ((ancho_eff * espesor_eff * length_mm * densidad) / 1_000_000_000.0)
+            else:
+                status_messages.append("Falta ancho, espesor o largo")
+
+        total_weight = unit_weight * qty
+        if price_resolver is not None:
+            thickness_ref_mm = thickness or (stock_nums[1] if shape in ("RECTANGULAR", "CUADRADO") and len(stock_nums) >= 2 else 0.0)
+            price_kg = price_resolver(material, shape, shape_hint, thickness_ref_mm) or 0.0
+            if price_kg <= 0 and material_label and material_label != material:
+                price_kg = price_resolver(material_label, shape, shape_hint, thickness_ref_mm) or 0.0
+        if price_kg <= 0:
+            price_kg = max(precio_default_kg, 0.0)
+        if price_kg <= 0:
+            status_messages.append("Sin precio configurado para material/forma")
+
+        unit_cost = unit_weight * price_kg
+        total_cost = unit_cost * qty
+
+    status = "OK" if not status_messages else f"WARN: {'; '.join(status_messages)}"
+    erp_row = _build_erp_row(
+        mapped=mapped,
+        part_no=part_no,
+        description=description,
+        qty=qty,
+        unit_cost=unit_cost,
+        level=level_value,
+        stock_raw=stock_raw,
+        status=status,
+        shape=shape,
+        material_label=material_label,
+        computed_weight_kg=total_weight,
+        input_weight=weight_input,
+        length_mm=length_value,
+        width_mm=width,
+        thickness_mm=thickness,
+        parent_fallback=parent_fallback,
+        sequence=sequence,
+        fabricante=fabricante,
+    )
+
+    return LlmBomRow(
+        item=str(item),
+        part_no=part_no,
+        description=description,
+        material=material,
+        shape=shape,
+        qty=qty,
+        stock_size_raw=stock_raw,
+        length_mm=length_mm,
+        unit_weight_kg=unit_weight,
+        total_weight_kg=total_weight,
+        price_kg_mxn=price_kg,
+        unit_cost_mxn=unit_cost,
+        total_cost_mxn=total_cost,
+        source_row=source_row,
+        status=status,
+        erp_row=erp_row,
+        is_stk=False,
+    )
+
+
+def _build_erp_row(
+    *,
+    mapped: dict[str, str],
+    part_no: str,
+    description: str,
+    qty: float,
+    unit_cost: float,
+    level: int,
+    stock_raw: str,
+    status: str,
+    shape: str,
+    material_label: str,
+    computed_weight_kg: float,
+    input_weight: float | None,
+    length_mm: float | None,
+    width_mm: float | None,
+    thickness_mm: float | None,
+    parent_fallback: str,
+    sequence: int,
+    fabricante: str,
+) -> list[object]:
+    memo2 = mapped.get("memo2", "").strip()
+    source_val = _infer_source_value(
+        mapped_source=mapped.get("source", ""),
+        part_no=part_no,
+        fabricante=fabricante,
+        level=level,
+    )
+    productline = _infer_productline_value(
+        mapped_productline=mapped.get("productline", ""),
+        part_no=part_no,
+        fabricante=fabricante,
+        source_val=source_val,
+        level=level,
+    )
+    sequence_value = _to_float(mapped.get("sequence"))
+    if sequence_value is None:
+        sequence_value = max(0, sequence - 1)
+
+    row_map: dict[str, object] = {
+        "PartNo": part_no or f"SIN-PN-{sequence:04d}",
+        "Revision": mapped.get("revision", ""),
+        "Description": description,
+        "AltDescription1": mapped.get("alt_description_1", ""),
+        "AltDescription2": mapped.get("alt_description_2", ""),
+        "DescExtra": mapped.get("desc_extra", ""),
+        "Quantity": qty,
+        "IssueUM": mapped.get("issue_um", "") or "PZ",
+        "ConsumptionConv": _to_float(mapped.get("consumption_conv")) or 0,
+        "UM": mapped.get("um", "") or "PZ",
+        "Cost": round(unit_cost, 6),
+        "Source": source_val,
+        "Drawing": mapped.get("drawing", ""),
+        "Leadtime": mapped.get("leadtime", ""),
+        "Level": level,
+        "Location": mapped.get("location", ""),
+        "Memo1": mapped.get("memo1", ""),
+        "Memo2": memo2,
+        "Parent": mapped.get("parent", "") or parent_fallback,
+        "Productline": productline,
+        "Sequence": int(sequence_value),
+        "ShotCode": mapped.get("shotcode", ""),
+        "Tag": mapped.get("tag", ""),
+        "Category": mapped.get("category", "") or "Blank",
+        "fabricante": fabricante,
+        "filepat": mapped.get("path", ""),
+        "Material": material_label,
+        "Peso": input_weight if input_weight is not None else (round(computed_weight_kg, 6) if computed_weight_kg > 0 else None),
+        "largo": length_mm if length_mm is not None else None,
+        "ancho": width_mm if width_mm is not None else None,
+        "espesor": thickness_mm if thickness_mm is not None else None,
+        "tratamiento": mapped.get("thermal_treatment", ""),
+    }
+    return [row_map.get(h, "") for h in _ERP_HEADERS]
+
+
+def _build_stk_row_from_base(
+    *,
+    base: LlmBomRow,
+    mapped: dict[str, str],
+    source_row: int,
+    sequence: int,
+) -> LlmBomRow | None:
+    fabricante = _resolve_fabricante(mapped, "")
+    if not _is_cost_allowed_manufacturer(fabricante):
+        return None
+    if not base.part_no or base.part_no.upper().endswith("-STK"):
+        return None
+    if base.shape not in {"REDONDO", "CUADRADO", "RECTANGULAR", "TUBO"}:
+        return None
+    if not (mapped.get("stock_size", "") or mapped.get("length", "") or mapped.get("diameter", "") or mapped.get("thickness", "") or mapped.get("width", "")):
+        return None
+    level = int(_to_float(mapped.get("level")) or 0)
+    if level <= 0:
+        return None
+
+    stk_part_no = f"{base.part_no}-STK"
+    stk_desc = _build_stk_description(base.material, mapped, base.shape)
+    memo2 = (mapped.get("memo2") or "").strip()
+    sequence_value = int(max(0, sequence - 1))
+    row_map: dict[str, object] = {
+        "PartNo": stk_part_no,
+        "Revision": mapped.get("revision", ""),
+        "Description": stk_desc,
+        "AltDescription1": "",
+        "AltDescription2": "",
+        "DescExtra": "",
+        "Quantity": 1,
+        "IssueUM": mapped.get("issue_um", "") or "PZ",
+        "ConsumptionConv": _to_float(mapped.get("consumption_conv")) or 0,
+        "UM": mapped.get("um", "") or "PZ",
+        "Cost": 0,
+        "Source": "J",
+        "Drawing": "",
+        "Leadtime": mapped.get("leadtime", ""),
+        "Level": level + 1,
+        "Location": mapped.get("location", ""),
+        "Memo1": "",
+        "Memo2": memo2,
+        "Parent": base.part_no,
+        "Productline": "AC",
+        "Sequence": sequence_value,
+        "ShotCode": mapped.get("shotcode", ""),
+        "Tag": mapped.get("tag", ""),
+        "Category": mapped.get("category", "") or "Blank",
+        "fabricante": fabricante,
+        "filepat": "",
+        "Material": None,
+        "Peso": None,
+        "largo": None,
+        "ancho": None,
+        "espesor": None,
+        "tratamiento": "",
+    }
+    erp_row = [row_map.get(h, "") for h in _ERP_HEADERS]
+    return LlmBomRow(
+        item=f"{base.item}-STK",
+        part_no=stk_part_no,
+        description=stk_desc,
+        material=base.material,
+        shape=base.shape,
+        qty=1.0,
+        stock_size_raw=base.stock_size_raw,
+        length_mm=base.length_mm,
+        unit_weight_kg=0.0,
+        total_weight_kg=0.0,
+        price_kg_mxn=0.0,
+        unit_cost_mxn=0.0,
+        total_cost_mxn=0.0,
+        source_row=source_row,
+        status="OK",
+        erp_row=erp_row,
+        is_stk=True,
+    )
+
+
+def _build_stk_description(material_text: str, mapped: dict[str, str], shape: str) -> str:
+    material = (material_text or "").strip()
+    length = _to_float(mapped.get("length")) or 0.0
+    width = _to_float(mapped.get("width")) or 0.0
+    thickness = _to_float(mapped.get("thickness")) or 0.0
+    if thickness <= 0:
+        thickness = _to_float(mapped.get("thickness_or_diameter")) or 0.0
+    diameter = _to_float(mapped.get("diameter")) or thickness
+    shape_u = (shape or "").strip().upper()
+    if shape_u in {"REDONDO", "TUBO"} and diameter > 0 and length > 0:
+        return f"{material} DIA.{_fmt_num(diameter)} x {_fmt_num(length)}".strip()
+    if shape_u == "CUADRADO" and width > 0 and length > 0:
+        return f"{material} {_fmt_num(width)} x {_fmt_num(width)} x {_fmt_num(length)}".strip()
+    if thickness > 0 and width > 0 and length > 0:
+        return f"{material} {_fmt_num(thickness)} x {_fmt_num(width)} x {_fmt_num(length)}".strip()
+    stock = (mapped.get("stock_size") or "").strip()
+    return f"{material} {stock}".strip()
+
+
+def _fmt_num(value: float) -> str:
+    return f"{float(value):.4f}".rstrip("0").rstrip(".")
+
+
+def _resolve_fabricante(mapped: dict[str, str], fabricante_default: str) -> str:
+    fabricante = mapped.get("fabricante", "") or mapped.get("fabricado_por", "") or fabricante_default
+    return (fabricante or "").strip()
+
+
+def _is_cost_allowed_manufacturer(fabricante: str) -> bool:
+    return _normalize_token(fabricante) in _COST_ALLOWED_MANUFACTURERS_NORMALIZED
+
+
+def _is_hi_manufacturer(fabricante: str) -> bool:
+    return _normalize_token(fabricante) in _HI_MANUFACTURERS_NORMALIZED
+
+
+def _infer_source_value(*, mapped_source: str, part_no: str, fabricante: str, level: int) -> str:
+    raw = (mapped_source or "").strip().upper()
+    if raw:
+        return raw
+    if level <= 0:
+        return "F"
+    if (part_no or "").strip().upper().endswith("-STK"):
+        return "J"
+    if _is_cost_allowed_manufacturer(fabricante):
+        return "F"
+    return "J"
+
+
+def _infer_productline_value(
+    *,
+    mapped_productline: str,
+    part_no: str,
+    fabricante: str,
+    source_val: str,
+    level: int,
+) -> str:
+    raw = (mapped_productline or "").strip().upper()
+    if raw:
+        return raw
+    if level <= 0:
+        return "PT"
+    # Regla 1: prioridad por PartNo -STK.
+    if (part_no or "").strip().upper().endswith("-STK"):
+        return "AC"
+    # Regla 2: prioridad por proveedor/fabricante.
+    if _is_hi_manufacturer(fabricante):
+        return "HI"
+    if _is_cost_allowed_manufacturer(fabricante):
+        return "MP"
+    # Regla 3: fallback por Source.
+    src = (source_val or "").strip().upper()
+    if src == "P":
+        return "AC"
+    if src == "M":
+        return "PT"
+    if src == "F":
+        return "MP"
+    return "SU"
+
+
+def _normalize_token(value: str) -> str:
+    folded = unicodedata.normalize("NFKD", value or "")
+    ascii_only = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "", ascii_only).upper()
+    return cleaned
+
+
+def _infer_shape(
+    shape_hint: str,
+    stock_raw: str,
+    stock_nums: list[float],
+    diameter: float | None,
+    width: float | None,
+    thickness: float | None,
+) -> str:
+    text = f"{shape_hint} {stock_raw}".upper()
+    if any(k in text for k in ("TUBO", "HUECO", "PIPE", "TUBE")):
+        return "TUBO"
+    if any(k in text for k in ("REDON", "ROUND", "BARA REDONDA", "BARRA REDONDA")):
+        return "REDONDO"
+    if any(k in text for k in ("CUAD", "SQUARE", "BARA CUADRADA", "BARRA CUADRADA")):
+        return "CUADRADO"
+    if any(k in text for k in ("RECT", "PLACA", "PLATINA", "FLAT", "SOLERA")):
+        return "RECTANGULAR"
+    if any(k in text for k in ("DIA", "DIAM")):
+        return "REDONDO"
+    if diameter and diameter > 0 and (width is None or width <= 0) and (thickness is None or thickness <= 0):
+        return "REDONDO"
+    if thickness and thickness > 0:
+        return "RECTANGULAR"
+    if len(stock_nums) >= 2 and abs(stock_nums[0] - stock_nums[1]) <= 0.001 and (width is None or width > 0):
+        return "CUADRADO"
+    return "RECTANGULAR"
+
+
+def _apply_tolerance(value: float, tolerance_mm: float) -> float:
+    if value <= 0:
+        return 0.0
+    return value + tolerance_mm
+
+
+def _infer_square_dims(stock_nums: list[float]) -> tuple[float, float]:
+    if not stock_nums:
+        return 0.0, 0.0
+    if len(stock_nums) == 1:
+        return stock_nums[0], 0.0
+    if len(stock_nums) == 2:
+        return stock_nums[0], stock_nums[1]
+    side = min(stock_nums[0], stock_nums[1])
+    length = max(stock_nums)
+    return side, length
+
+
+def _infer_rect_dims(stock_nums: list[float]) -> tuple[float, float, float]:
+    if not stock_nums:
+        return 0.0, 0.0, 0.0
+    if len(stock_nums) == 1:
+        return stock_nums[0], 0.0, 0.0
+    if len(stock_nums) == 2:
+        return stock_nums[0], stock_nums[1], 0.0
+    ordered = sorted(stock_nums[:3])
+    espesor = ordered[0]
+    largo = ordered[2]
+    ancho = ordered[1]
+    return ancho, espesor, largo
+
+
+def _infer_tube_dims(
+    stock_nums: list[float],
+    length_value: float | None,
+    diameter_value: float | None,
+    thickness_value: float | None,
+) -> tuple[float, float, float]:
+    od = 0.0
+    id_ = 0.0
+    length = 0.0
+
+    if len(stock_nums) >= 3:
+        od = max(stock_nums[0], stock_nums[1])
+        id_ = min(stock_nums[0], stock_nums[1])
+        length = stock_nums[2]
+    elif len(stock_nums) == 2:
+        od = stock_nums[0]
+        id_ = stock_nums[1]
+    elif len(stock_nums) == 1:
+        od = stock_nums[0]
+
+    if diameter_value and diameter_value > 0:
+        od = diameter_value
+    if thickness_value and thickness_value > 0 and od > 0:
+        # Si viene espesor de pared, convertir a diámetro interior.
+        maybe_id = od - (2.0 * thickness_value)
+        if maybe_id > 0:
+            id_ = maybe_id
+    if length_value and length_value > 0:
+        length = length_value
+    return od, id_, length
+
+
+def _write_output_xlsx(path: str, rows: Iterable[LlmBomRow], *, template_path: str | None) -> None:
+    wb: Workbook
+    ws = None
+
+    if template_path and Path(template_path).exists():
+        wb = load_workbook(template_path)
+        ws = _pick_template_sheet(wb)
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "GLOBAL_SHOP"
+
+    assert ws is not None
+    headers = [_to_text(v) for v in ws[1]]
+    expected = [_normalize_header(h) for h in _ERP_HEADERS]
+    current = [_normalize_header(h) for h in headers]
+    if current[: len(expected)] != expected:
+        ws.delete_rows(1, ws.max_row)
+        ws.append(_ERP_HEADERS)
+    else:
+        _clear_sheet_data(ws, start_row=2)
+
+    for row in rows:
+        ws.append(row.erp_row)
+
+    ws.freeze_panes = "A2"
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+
+
+def _pick_template_sheet(wb: Workbook):
+    expected = _normalize_header("PartNo")
+    for ws in wb.worksheets:
+        first = _normalize_header(_to_text(ws.cell(1, 1).value))
+        if first == expected:
+            return ws
+    return wb.active
+
+
+def _clear_sheet_data(ws, *, start_row: int) -> None:
+    if ws.max_row < start_row:
+        return
+    for row in range(start_row, ws.max_row + 1):
+        for col in range(1, ws.max_column + 1):
+            ws.cell(row=row, column=col).value = None
+
+
+def _extract_numbers(text: str) -> list[float]:
+    normalized = text.replace(",", ".")
+    return [float(x) for x in re.findall(r"[-+]?\d*\.?\d+", normalized)]
+
+
+def _row_is_empty(row: tuple[object, ...]) -> bool:
+    for value in row:
+        if _to_text(value).strip():
+            return False
+    return True
+
+
+def _to_float(value: object) -> float | None:
+    if value is None:
+        return None
+    text = _to_text(value).strip()
+    if not text:
+        return None
+    text = text.replace(",", ".")
+    match = re.search(r"[-+]?\d*\.?\d+", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
+
+
+def _to_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_header(text: str) -> str:
+    folded = unicodedata.normalize("NFKD", text)
+    ascii_only = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    cleaned = re.sub(r"[^a-z0-9\s]+", " ", ascii_only.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _header_alias_match(cell: str, alias: str) -> bool:
+    alias_norm = _normalize_header(alias)
+    if not alias_norm:
+        return False
+    if cell == alias_norm:
+        return True
+
+    # Permite coincidencia compacta para encabezados como "PartNo" vs "part no".
+    if cell.replace(" ", "") == alias_norm.replace(" ", ""):
+        return True
+
+    # Evita falsos positivos por subcadena (ej. "peso" dentro de "espesor").
+    pattern = rf"(?<![a-z0-9]){re.escape(alias_norm)}(?![a-z0-9])"
+    return re.search(pattern, cell) is not None
